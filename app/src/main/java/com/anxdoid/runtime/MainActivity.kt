@@ -1,128 +1,135 @@
 package com.anxdoid.runtime
 
-import android.annotation.SuppressLint
+import android.app.Activity
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
-import android.util.Log
-import android.view.MotionEvent
-import android.view.SurfaceHolder
-import android.view.SurfaceView
-import android.view.View
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import com.anxdoid.runtime.core.NativeBridge
 import java.io.File
+import java.io.FileOutputStream
+import java.io.InputStream
+import kotlin.concurrent.thread
 
-class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
+class MainActivity : AppCompatActivity() {
 
-    companion object {
-        private const val TAG = "AnxdoidHost"
+    private lateinit var statusTextView: TextView
+    private lateinit var selectFirmwareButton: Button
+    
+    // Регистрация обработчика SAF для выбора файлов с расширением .img
+    private val filePickerLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            result.data?.data?.let { uri ->
+                handleSelectedFirmware(uri)
+            }
+        } else {
+            updateStatus("Выбор прошивки отменен.")
+        }
     }
 
-    private lateinit var guestSurfaceView: SurfaceView
-    private lateinit var statusText: TextView
-    private lateinit var btnBoot: Button
-    private lateinit var btnReset: Button
-    private lateinit var hudOverlay: View
-
-    private var isSurfaceReady = false
-    private var isGuestRunning = false
-
-    @SuppressLint("ClickableViewAccessibility")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
-
-        guestSurfaceView = findViewById(R.id.guestSurfaceView)
-        statusText = findViewById(R.id.statusText)
-        btnBoot = findViewById(R.id.btnBoot)
-        btnReset = findViewById(R.id.btnReset)
-        hudOverlay = findViewById(R.id.hudOverlay)
-
-        guestSurfaceView.holder.addCallback(this)
-
-        // Setup touch forwarding to guest
-        guestSurfaceView.setOnTouchListener { _, event ->
-            if (isGuestRunning) {
-                NativeBridge.sendTouchEvent(
-                    action = event.actionMasked,
-                    x = event.x,
-                    y = event.y,
-                    pressure = event.pressure
-                )
-            }
-            true
+        
+        // Динамическое создание UI, чтобы не зависеть от изменений в xml
+        val layout = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            gravity = android.view.Gravity.CENTER
+            padding = 32
         }
 
-        // Initialize Native Runtime directories
-        val baseDir = filesDir.absolutePath
-        val rootfsDir = File(filesDir, "rootfs").absolutePath
-        File(rootfsDir).mkdirs()
-
-        val initialized = NativeBridge.initRuntime(baseDir, rootfsDir)
-        if (initialized) {
-            statusText.text = getString(R.string.status_ready)
-            Log.i(TAG, "Native runtime initialized. Rootfs: $rootfsDir")
-        } else {
-            statusText.text = "Failed to initialize native C++ runtime!"
-            Log.e(TAG, "Failed to initialize native runtime.")
+        statusTextView = TextView(this).apply {
+            text = "Рантайм готов. Выберите образ прошивки (.img)"
+            textSize = 16f
+            gravity = android.view.Gravity.CENTER
+            setPadding(0, 0, 0, 48)
         }
 
-        btnBoot.setOnClickListener {
-            if (!isSurfaceReady) {
-                Toast.makeText(this, "Surface not ready yet", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
+        selectFirmwareButton = Button(this).apply {
+            text = "Выбрать system.img через SAF"
+            setOnClickListener {
+                openFilePicker()
             }
+        }
 
-            statusText.text = "Starting Guest Android Process…"
-            val pid = NativeBridge.startGuestRuntime()
-            if (pid > 0) {
-                isGuestRunning = true
-                statusText.text = "Guest Android running (PID: $pid)"
-                btnBoot.isEnabled = false
-                Log.i(TAG, "Guest runtime launched successfully with PID: $pid")
+        layout.addView(statusTextView)
+        layout.addView(selectFirmwareButton)
+        setContentView(layout)
+    }
+
+    private fun openFilePicker() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*" // Запрашиваем все типы, фильтрацию по имени сделаем при получении
+        }
+        filePickerLauncher.launch(intent)
+    }
+
+    private fun handleSelectedFirmware(uri: Uri) {
+        updateStatus("Копирование образа во внутреннюю память...")
+        selectFirmwareButton.isEnabled = false
+
+        // Запуск в фоновом потоке, так как system.img может весить несколько гигабайт
+        thread(start = true) {
+            try {
+                val targetDir = File(filesDir, "rootfs")
+                if (!targetDir.exists()) {
+                    targetDir.mkdirs()
+                }
+
+                // Целевой файл внутри приватного хранилища приложения
+                val targetFile = File(targetDir, "system.img")
+                
+                contentResolver.openInputStream(uri).use { inputStream ->
+                    if (inputStream == null) throw Exception("Не удалось открыть выбранный файл")
+                    
+                    FileOutputStream(targetFile).use { outputStream ->
+                        val buffer = ByteArray(1024 * 1024) // Буфер 1 МБ для быстрой скорости копирования
+                        var bytesRead: Int
+                        while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                            outputStream.write(buffer, 0, bytesRead)
+                        }
+                    }
+                }
+
+                // Файл успешно скопирован, запускаем рантайм
+                runOnUiThread {
+                    updateStatus("Образ успешно загружен! Запуск Anxdoid...")
+                    bootAnxdoidRuntime(targetFile.absolutePath)
+                }
+
+            } catch (e: Exception) {
+                runOnUiThread {
+                    selectFirmwareButton.isEnabled = true
+                    updateStatus("Ошибка при обработке файла: ${e.localizedMessage}")
+                    Toast.makeText(this@MainActivity, "Ошибка копирования", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    private fun bootAnxdoidRuntime(firmwarePath: String) {
+        try {
+            // Передаем путь к образу в наш JNI слой
+            val result = NativeBridge.initializeRuntime(firmwarePath)
+            if (result == 0) {
+                updateStatus("Anxdoid запущен из: $firmwarePath")
             } else {
-                statusText.text = "Guest runtime launcher returned: $pid"
-                Log.w(TAG, "Guest runtime not started, code: $pid")
+                updateStatus("Ошибка запуска рантайма. Код ошибки: $result")
+                selectFirmwareButton.isEnabled = true
             }
-        }
-
-        btnReset.setOnClickListener {
-            val rootfs = File(filesDir, "rootfs")
-            val dataDir = File(rootfs, "data")
-            if (dataDir.exists()) {
-                dataDir.deleteRecursively()
-                Toast.makeText(this, "Guest data wiped cleanly (Instant Reset)", Toast.LENGTH_SHORT).show()
-                Log.i(TAG, "Guest data partition purged.")
-            } else {
-                Toast.makeText(this, "Guest data is already clean.", Toast.LENGTH_SHORT).show()
-            }
+        } catch (e: Exception) {
+            updateStatus("Критическая ошибка JNI: ${e.localizedMessage}")
+            selectFirmwareButton.isEnabled = true
         }
     }
 
-    override fun surfaceCreated(holder: SurfaceHolder) {
-        Log.i(TAG, "Surface created, attaching to NativeBridge...")
-        val attached = NativeBridge.setSurface(holder.surface)
-        isSurfaceReady = attached
-        Log.i(TAG, "Surface attached result: $attached")
-    }
-
-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        Log.i(TAG, "Surface changed: ${width}x${height}, format: $format")
-        NativeBridge.setSurface(holder.surface)
-    }
-
-    override fun surfaceDestroyed(holder: SurfaceHolder) {
-        Log.i(TAG, "Surface destroyed")
-        isSurfaceReady = false
-        NativeBridge.clearSurface()
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        if (isGuestRunning) {
-            NativeBridge.stopGuestRuntime()
-        }
+    private fun updateStatus(message: String) {
+        statusTextView.text = message
     }
 }
